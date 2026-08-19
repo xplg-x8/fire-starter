@@ -9,7 +9,7 @@ run it all in production.
 ```bash
 # Deploy a single-node XPLG cluster in three commands
 git clone https://github.com/xplg-x8/fire-starter.git
-cd fire-starter/services/xplg-service
+cd fire-starter/services/xplg-service/compose
 docker compose -f docker-compose.yml -f docker-compose.traefik.yml up -d
 ```
 
@@ -78,26 +78,50 @@ services/xplg-service/
 ├── README.md                     what it is, its ports, its topologies
 ├── VERSION                       1.0.0  — this service's own version
 ├── CHANGELOG.md
-│
 ├── stack.yaml                    identity, roles, startup order, deploy_modes
 ├── plugin.yaml                   ports, engines, resources, verify endpoints
 ├── params.yaml                   every parameter: type, default, help
 │
-├── .env                          ← the only file you edit
-├── docker-compose.yml            ← the roles
-├── docker-compose.traefik.yml    ← add this file to get a load balancer
-├── docker-compose.podman.yml     ← add this file for podman rootless
+├── compose/                      ← vessel: docker / podman
+│   ├── docker-compose.yml            the default — always works
+│   ├── docker-compose.traefik.yml    FEATURE overlay: add a load balancer
+│   ├── .env                          the default profile
+│   ├── conf/                         runtime config the containers mount
+│   ├── platforms/                    WHERE it lands
+│   │   ├── docker.yml                    baseline
+│   │   └── podman.yml                    rootless uid mapping
+│   └── profiles/                     WHAT SHAPE
+│       ├── local.env                     a single file…
+│       ├── single-node.env
+│       └── ha/                           …or a folder, when it needs more
+│           ├── .env
+│           └── conf/dynamic/tls.yml
 │
-├── profiles/                     ready-made shapes
-│   ├── local.env                 one host, no LB
-│   ├── single-node.env           one server + Traefik
-│   └── ha.env                    multi-server + shared storage
+├── helm/                         ← vessel: kubernetes   (when supported)
+│   ├── Chart.yaml  values.yaml       version + appVersion; values is the default
+│   ├── platforms/                    vanilla, openshift, gke, eks, aks, tanzu, rancher
+│   ├── extras/openshift/scc.yaml     objects that exist only on one platform
+│   └── profiles/{local,ha}.yaml
 │
-├── conf/                         runtime config the containers mount
-│   ├── dynamic/  registry/  ssl/
+├── terraform/                    ← vessel: provisioning  (when supported)
+│   └── targets/{aws-ec2,aws-eks,gcp-gke}/
 │
 └── tests/                        render + smoke tests for this service
 ```
+
+Four things hold everywhere:
+
+- **Every deployment type has a default that works with no arguments.** Run the
+  default and you get a working single-node system — you only pick a profile when
+  you want something else.
+- **A profile is a file or a folder.** One file when an env file is enough; a
+  folder when the shape also needs certificates, drop-in routes or extra
+  variables. A folder profile is an overlay tree — same paths, one level down.
+- **`platforms/` and `profiles/` compose.** Where it lands and what shape it is
+  are independent, so `ha` on `openshift` is just two files stacked.
+- **A vessel folder exists only if it is supported.** No `helm/` means Kubernetes
+  is not shipped for that service yet. Absence is the answer, not an empty stub.
+
 
 ---
 
@@ -107,10 +131,23 @@ services/xplg-service/
 the repo:
 
 ```bash
-cd services/xplg-service
-cp profiles/single-node.env .env      # pick a shape
-vi .env                               # set your IPs and paths
+cd services/xplg-service/compose
+
+# the default — single node, docker, no load balancer
+docker compose up -d
+
+# pick a shape, then edit your IPs and paths
+cp profiles/single-node.env .env && vi .env
 docker compose -f docker-compose.yml -f docker-compose.traefik.yml up -d
+
+# on podman rootless: add the platform overlay
+docker compose -f docker-compose.yml                -f platforms/podman.yml                -f docker-compose.traefik.yml up -d
+```
+
+On Kubernetes, shape and platform stack the same way:
+
+```bash
+helm install xplg ./services/xplg-service/helm   -f services/xplg-service/helm/profiles/ha.yaml   -f services/xplg-service/helm/platforms/openshift.yaml
 ```
 
 **With the `x8fire` CLI** — adds a catalog browser, guided parameters, a
@@ -164,7 +201,10 @@ Full rules and examples: **[NAMING.md](NAMING.md)**
 | Thing | Pattern | Example |
 | --- | --- | --- |
 | Service folder | `xplg-<name>` kebab-case | `services/xplg-service/` |
-| Profile | `<shape>.env` | `profiles/ha.env` |
+| Vessel | fixed vocabulary | `compose/` `helm/` `terraform/` |
+| Platform | `platforms/<name>.<ext>` | `helm/platforms/openshift.yaml` |
+| Profile (file) | `<shape>.<ext>` | `compose/profiles/ha.env` |
+| Profile (folder) | `<shape>/` | `compose/profiles/ha/` |
 | Compose overlay | `docker-compose.<concern>.yml` | `docker-compose.traefik.yml` |
 | Env var | `XPLG_<AREA>_<THING>` | `XPLG_TRAEFIK_UI_SERVERS` |
 | Port var | `<ROLE>_<KIND>_PORT` | `MASTER_HTTP_PORT` |
