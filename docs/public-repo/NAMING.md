@@ -14,10 +14,15 @@ change later. CI enforces the patterns marked ✅ **enforced**.
 | --- | --- | --- | --- |
 | Service folder | `xplg-<name>` | `services/xplg-service/` | ✅ |
 | Service descriptor | fixed names | `stack.yaml` `plugin.yaml` `params.yaml` | ✅ |
-| Profile | `<shape>.env` | `profiles/ha.env` | ✅ |
+| Vessel folder | `compose` `helm` `kustomize` `ansible` `terraform` | `services/xplg-service/helm/` | ✅ |
+| Platform overlay | `platforms/<platform>.<ext>` | `helm/platforms/openshift.yaml` | ✅ |
+| Terraform target | `targets/<cloud>-<service>/` | `terraform/targets/aws-eks/` | ✅ |
+| Feature overlay | `docker-compose.<feature>.yml` | `docker-compose.traefik.yml` | ✅ |
+| Profile — file | `<shape>.<ext>` | `compose/profiles/ha.env` | ✅ |
+| Profile — folder | `<shape>/` | `compose/profiles/ha/` | ✅ |
 | Base compose | `docker-compose.yml` | — | ✅ |
 | Compose overlay | `docker-compose.<concern>.yml` | `docker-compose.traefik.yml` | ✅ |
-| Helm values per profile | `values-<profile>.yaml` | `values-ha.yaml` | ✅ |
+| Helm profile | `profiles/<shape>.yaml` | `helm/profiles/ha.yaml` | ✅ |
 | Env var | `XPLG_<AREA>_<THING>` | `XPLG_TRAEFIK_UI_SERVERS` | ✅ |
 | Port var | `<ROLE>_<KIND>_PORT` | `MASTER_HTTP_PORT` | ✅ |
 | Node alias | `xplg-seed-<n>` | `xplg-seed-2` | |
@@ -52,34 +57,171 @@ it as not-a-service.
 
 ---
 
-## Profiles
+## Vessels
 
-A profile is a **shape**, not a place. Name it after the topology, never after a
-customer, a datacentre or an environment tier.
+A vessel is one way of delivering the service. The folder name is fixed
+vocabulary, not free text:
 
 ```
-✅  profiles/local.env             one host, loopback, no LB
-✅  profiles/single-node.env       one real server + Traefik
-✅  profiles/ha.env                multi-server + shared storage
-✅  profiles/airgap.env            mirrored registry, no egress
+✅  compose/     packaging    docker + podman
+✅  helm/        packaging    kubernetes via helm
+✅  kustomize/   packaging    raw manifests + overlays
+✅  ansible/     packaging    host configuration + deploy
+✅  terraform/   provisioning creates the infrastructure
 
-❌  profiles/prod.env              "prod" is a place, not a shape
-❌  profiles/acme-corp.env         customer instance → environments/, not here
-❌  profiles/ha-v2.env             version the service, not the profile
+❌  docker/      ambiguous — compose or plain run?
+❌  kubernetes/  use helm/ or kustomize/, whichever you ship
+❌  iac/         a bucket, not a vessel — split it
+❌  openshift/   a PLATFORM, not a vessel — see below
+```
+
+Vessels come in two kinds, and `stack.yaml` says which:
+
+| Kind | Vessels | Second axis |
+| --- | --- | --- |
+| **packaging** — expresses the app | `compose` `helm` `kustomize` `ansible` | `platforms/` |
+| **provisioning** — builds what it runs on | `terraform` | `targets/` |
+
+A vessel folder exists **only if supported**. Absence is the support signal; an
+empty folder is a bug.
+
+---
+
+## Platforms
+
+Where the packaged app lands. A platform overlay adjusts the package for that
+runtime's rules — it never forks it.
+
+```
+✅  compose/platforms/docker.yml       the baseline (no-op)
+✅  compose/platforms/podman.yml       rootless uid mapping
+✅  helm/platforms/vanilla.yaml        the baseline
+✅  helm/platforms/openshift.yaml      Route, SCC, no pinned runAsUser
+✅  helm/platforms/gke.yaml            Workload Identity, GCE ingress
+✅  helm/platforms/eks.yaml            IRSA, ALB controller, EBS CSI
+✅  helm/platforms/aks.yaml  tanzu.yaml  rancher.yaml
+
+❌  helm-openshift/                    a fork, not an overlay
+❌  helm/values-openshift-ha.yaml      two axes fused into one filename
+```
+
+**Platform and profile compose — that is why they are separate directories:**
+
+```bash
+helm install xplg ./helm   -f helm/profiles/ha.yaml   -f helm/platforms/openshift.yaml
+```
+
+Objects that exist **only** on one platform (an OpenShift `SecurityContextConstraints`,
+say) are not values — they go in `extras/<platform>/`.
+
+### Terraform uses `targets/`, not `platforms/`
+
+Terraform *creates* the platform, so its second axis is the cloud landing zone:
+
+```
+✅  terraform/targets/aws-ec2/         VMs for the compose path
+✅  terraform/targets/aws-eks/         a cluster for the helm path
+✅  terraform/targets/gcp-gke/  azure-aks/  onprem-vsphere/
+
+❌  terraform/platforms/aws/           it builds the platform; it isn't one
+```
+
+Name them `<cloud>-<service>` so the pairing with a packaging vessel is obvious:
+`aws-ec2` feeds `compose/`, `aws-eks` feeds `helm/`.
+
+---
+
+## Overlay kinds — three different things, three names
+
+These currently all look alike. They are not alike:
+
+| Kind | Answers | Lives in | Example |
+| --- | --- | --- | --- |
+| **Feature** | "also give me X" | vessel root, `docker-compose.<feature>.yml` | `docker-compose.traefik.yml` |
+| **Platform** | "adapt to runtime Y" | `platforms/` | `platforms/podman.yml` |
+| **Profile** | "make it shape Z" | `profiles/` | `profiles/ha.env` |
+
+> `docker-compose.podman.yml` in today's repo is misfiled by this rule — it is a
+> **platform** overlay and belongs at `compose/platforms/podman.yml`.
+> `docker-compose.traefik.yml` is genuinely a feature overlay and stays put.
+
+---
+
+## Profiles
+
+A profile is a **shape**, not a place. Name it after the topology — never after a
+customer, a datacentre, or an environment tier.
+
+```
+✅  compose/profiles/local.env         one host, loopback, no LB
+✅  compose/profiles/single-node.env   one real server + Traefik
+✅  compose/profiles/ha/               multi-server + shared storage
+✅  compose/profiles/airgap.env        mirrored registry, no egress
+
+❌  compose/profiles/prod.env          "prod" is a place, not a shape
+❌  compose/profiles/acme-corp.env     customer instance → environments/
+❌  compose/profiles/ha-v2.env         version the service, not the profile
 ```
 
 > **Why this matters.** "prod" means something different to every reader, and it
-> invites a `dev.env` / `staging.env` / `prod.env` set that silently diverges.
-> A shape name is unambiguous and reusable: your prod *is* `ha`, and so is your
-> staging, differing only in the instance data.
+> invites a `dev` / `staging` / `prod` set that silently diverges. A shape name is
+> unambiguous and reusable: your prod *is* `ha`, and so is your staging —
+> differing only in instance data.
 
-The same profile name is used across every deployment type:
+### The same name, in each type's native format
+
+Profiles live inside their deployment type because a compose profile and a Helm
+profile are different artifacts that cannot be substituted for one another. They
+share the **name**, not the directory:
 
 ```
-services/xplg-service/profiles/ha.env          compose
-services/xplg-service/helm/values-ha.yaml      helm
-services/xplg-service/terraform/ha.tfvars      terraform
+services/xplg-service/compose/profiles/ha.env         env file
+services/xplg-service/helm/profiles/ha.yaml           values file
+services/xplg-service/terraform/profiles/ha.tfvars    tfvars file
+services/xplg-service/ansible/profiles/ha/            inventory + group_vars
 ```
+
+`ha` is the same topology in all four. Keeping them in one directory would force
+disambiguating names (`ha.compose.env`, `ha.helm.yaml`) and invite passing the
+wrong one.
+
+### File or folder
+
+Both are first-class. Use a file until you need more than one.
+
+```
+profiles/local.env            file    → replaces the default .env
+profiles/ha/                  folder  → overlay tree
+├── .env
+├── conf/dynamic/tls.yml
+└── conf/registry/xplg-seed-2-ui.node
+```
+
+**A folder profile is an overlay rooted at its deployment type folder.** Its
+paths mirror the paths one level up, so applying it is a copy:
+
+```bash
+cd services/xplg-service/compose
+cp -r profiles/ha/. .
+```
+
+Nothing new to learn — if you know where a file lives in `compose/`, you know
+where it lives in `profiles/ha/`.
+
+### There is always a default
+
+Every deployment type ships something that runs with no profile selected:
+
+| Type | Default |
+| --- | --- |
+| `compose/` | `docker-compose.yml` + `.env` |
+| `helm/` | `values.yaml` |
+| `terraform/` | `terraform.tfvars` |
+| `ansible/` | `inventory.ini` (localhost) |
+| `k8s/` | `base/` |
+
+The default is **not** an entry in `profiles/`. It is what you get when you pick
+nothing, and `git clone && docker compose up -d` must work on it.
 
 ---
 
