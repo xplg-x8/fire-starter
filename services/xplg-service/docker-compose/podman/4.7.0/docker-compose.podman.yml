@@ -1,0 +1,56 @@
+# ============================================================================
+# xplg-service — Podman overrides (rootless AND rootful)
+# ----------------------------------------------------------------------------
+#   podman compose -f docker-compose.yml -f docker-compose.podman.yml up -d
+#   podman compose -f docker-compose.yml -f docker-compose.traefik.yml \
+#                  -f docker-compose.podman.yml up -d
+#
+# ROOTLESS  — keep-id maps container uid 30303 to the REAL host uid of the user
+#   running podman, so bind-mount files end up owned by that user and no real
+#   root is involved at any point. gid=0 matches the default SERVICE_GID=0; if
+#   you deploy with SERVICE_GID=30303 change every line to gid=30303.
+#
+# ROOTFUL / DOCKER — do NOT pass this file. That is the whole switch. The roles
+#   already run as user "30303:0"; rootful podman and docker map that straight
+#   to the host, so no userns remapping is wanted or needed.
+#
+# -- Verified rootless host prep (podman 5.8+/6.x, netavark 2.x) -------------
+#  * memlock: the roles ask for a 256m ulimit, above most distros' 64m hard
+#    limit -> "setrlimit RLIMIT_MEMLOCK: Operation not permitted". Raise it
+#    host-side (systemd DefaultLimitMEMLOCK=infinity, or limits.d) and re-login.
+#  * ports 80/443: rootless cannot bind below net.ipv4.ip_unprivileged_port_start
+#    (1024 by default). Either lower it —
+#        sudo sysctl -w net.ipv4.ip_unprivileged_port_start=80
+#    (persist in /etc/sysctl.d/) — or shift the entry ports in .env:
+#        XPLG_TRAEFIK_HTTP_PORT=8080  XPLG_TRAEFIK_HTTPS_PORT=8443
+#    The master entry (30303/30443) is already above 1024 and needs nothing.
+#  * traefik reaching the roles: the roles run host-network, Traefik runs on a
+#    rootless bridge (pasta). pasta mirrors the host's own IP inside the netns,
+#    so a backend pointing at THIS server's LAN IP is shadowed and 503s. Point
+#    local roles at host.containers.internal instead — that is what
+#    XPLG_TRAEFIK_REGISTER_HOST in .env is for. Other servers' seed IPs are
+#    unaffected.
+#  * netavark's nftables driver needs kernel nft_fib, which WSL kernels lack
+#    ("nft did not return successfully"). netavark 2.x dropped the iptables
+#    driver, so set firewall_driver = "none" under [network] in
+#    ~/.config/containers/containers.conf — pasta still does port publishing
+#    and egress NAT. Not needed on RHEL9.
+# ============================================================================
+
+# NOTE: node-register and traefik-init are deliberately NOT listed. They run
+# as container-root under the plain rootless mapping, which lands host uid ==
+# the deploying user — so conf/registry and conf/dynamic stay readable and
+# hand-editable by that user. keep-id here would hide them behind a subuid.
+services:
+  init-perms:
+    userns_mode: keep-id:uid=30303,gid=0
+  master:
+    userns_mode: keep-id:uid=30303,gid=0
+  ui:
+    userns_mode: keep-id:uid=30303,gid=0
+  listener:
+    userns_mode: keep-id:uid=30303,gid=0
+  processor:
+    userns_mode: keep-id:uid=30303,gid=0
+  processor-1:
+    userns_mode: keep-id:uid=30303,gid=0
