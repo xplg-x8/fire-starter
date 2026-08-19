@@ -1,0 +1,321 @@
+# ============================================================================
+# xplg-service — Traefik edge overlay
+# ----------------------------------------------------------------------------
+#   docker compose -f docker-compose.yml -f docker-compose.traefik.yml up -d
+#   podman compose -f docker-compose.yml -f docker-compose.traefik.yml \
+#                  -f docker-compose.podman.yml up -d
+#
+# Adding this file IS the switch — there is no traefik profile to remember.
+# Leave it off and the cluster runs on plain host ports.
+#
+# The edge runs HOST-NETWORK, like every role. One consequence matters: it uses
+# the same XPLG_SEED_N_IP map as the nodes, so a seed is defined exactly once
+# for the whole stack.
+#
+# ONE Traefik serves the WHOLE cluster: backends are addressed alias:port
+# exactly like cluster peers address each other, so it reaches nodes on every
+# server. Enable it on 2-3 servers only for extra, equal entry points (HA);
+# never chain traefik -> traefik.
+#
+# -- Entry points ------------------------------------------------------------
+#     :80    :443    -> ui pool       (the default web entry)
+#     :30303 :30443  -> master pool   (the master control entry)
+#     :8304 :8305 :8306 :8307 :8308   -> ui / listener / processor /
+#                                        processor-1 / master, FULL TREE
+#                                        (no prefix strip — use these for the
+#                                        role web consoles, which emit
+#                                        absolute /logeye paths)
+#     :8080 -> dashboard
+#
+# -- Path routes on :80/:443 -------------------------------------------------
+#     /                     -> ui pool
+#     /ui /master /listener /processor /processor1    -> role pool (sticky)
+#     /ui-1 /ui-2 ...       -> Nth member of that pool
+#     /<alias>-<role>       -> that exact node, e.g. /xplg-seed-2-ui
+#   The processor-1 ROLE is served at /processor1 (no dash) so that
+#   /processor-1 always means "1st member of the processor pool", whichever
+#   roles a given cluster runs. Its own members are /processor1-1, -2, ...
+#
+# -- How members are discovered ----------------------------------------------
+#   1. DECLARED in .env — XPLG_TRAEFIK_{MASTER,UI,LISTENER,PROCESSOR,
+#      PROCESSOR_1}_SERVERS, comma-separated seed aliases from the ONE seed map
+#      (XPLG_SEED_N_IP). Unset = SELF_ALIAS, i.e. single-server zero-config.
+#   2. REGISTERED on the filesystem — every node drops
+#      <registry>/<alias>-<role>.node (see node-register in docker-compose.yml).
+#      traefik-init below reconciles that folder into the route table on a
+#      loop, so a node started on ANY server joins its pool with no .env edit
+#      and no Traefik restart. Point XPLG_TRAEFIK_REGISTRY_PATH at a shared
+#      (NFS) directory to make registration cluster-wide.
+#   The two sources are unioned and de-duplicated. Dead entries cost nothing:
+#   the pool health check drops them until they answer again.
+#
+# -- Operator drop-ins -------------------------------------------------------
+#   conf/dynamic/ is a watched Traefik file-provider directory. xplg-routes.yml
+#   is OWNED by traefik-init (rewritten on every reconcile) — put custom
+#   routers, middlewares and TLS in SEPARATE files in the same folder, e.g.
+#   conf/dynamic/tls.yml pointing at certs in conf/ssl/.
+# ============================================================================
+
+services:
+
+  # -- traefik-init: reconciles .env + registry into the route table ---------
+  traefik-init:
+    image: ${XPLG_INIT_IMAGE:-alpine:3.24}
+    container_name: ${COMPOSE_PROJECT_NAME:-xplg-service}-${SELF_ALIAS:-xplg-seed-1}-traefik-init
+    restart: unless-stopped
+    user: root
+    environment:
+      XPLG_TRAEFIK_MASTER_SERVERS: ${XPLG_TRAEFIK_MASTER_SERVERS:-${SELF_ALIAS:-xplg-seed-1}}
+      XPLG_TRAEFIK_UI_SERVERS: ${XPLG_TRAEFIK_UI_SERVERS:-${SELF_ALIAS:-xplg-seed-1}}
+      XPLG_TRAEFIK_LISTENER_SERVERS: ${XPLG_TRAEFIK_LISTENER_SERVERS:-${SELF_ALIAS:-xplg-seed-1}}
+      XPLG_TRAEFIK_PROCESSOR_SERVERS: ${XPLG_TRAEFIK_PROCESSOR_SERVERS:-${SELF_ALIAS:-xplg-seed-1}}
+      XPLG_TRAEFIK_PROCESSOR_1_SERVERS: ${XPLG_TRAEFIK_PROCESSOR_1_SERVERS:-}
+      MASTER_HTTP_PORT: ${MASTER_HTTP_PORT:-30308}
+      UI_HTTP_PORT: ${UI_HTTP_PORT:-30304}
+      LISTENER_HTTP_PORT: ${LISTENER_HTTP_PORT:-30305}
+      PROCESSOR_HTTP_PORT: ${PROCESSOR_HTTP_PORT:-30306}
+      PROCESSOR_1_HTTP_PORT: ${PROCESSOR_1_HTTP_PORT:-30307}
+    volumes:
+      - ${XPLG_TRAEFIK_DYNAMIC_PATH:-./conf/dynamic}:/out:z
+      - ${XPLG_TRAEFIK_REGISTRY_PATH:-./conf/registry}:/registry:z
+    command:
+      - sh
+      - -ec
+      - |
+        mkdir -p /out /registry
+
+        # pool <role> <csv-of-aliases> <port>  ->  "<alias>|<host:port> ..."
+        pool() {
+          role="$$1"; csv="$$2"; port="$$3"; members=""
+          for a in $$(echo "$$csv" | tr ',' ' '); do
+            [ -n "$$a" ] && members="$$members $$a|$$a:$$port"
+          done
+          for f in /registry/*.node; do
+            [ -e "$$f" ] || continue
+            set -- $$(cat "$$f")
+            [ "$$1" = "$$role" ] || continue
+            members="$$members $$2|$$3"
+          done
+          uniq=""; seen=""
+          for m in $$members; do
+            hp="$${m#*|}"
+            case " $$seen " in *" $$hp "*) continue ;; esac
+            seen="$$seen $$hp"; uniq="$$uniq $$m"
+          done
+          echo "$$uniq"
+        }
+
+        upper() { echo "$$1" | tr 'a-z-' 'A-Z_'; }
+
+        # Path segment for a role. The processor-1 ROLE is exposed as
+        # /processor1 so that /processor-1 can keep its obvious meaning —
+        # "the 1st member of the processor pool" — no matter which roles this
+        # cluster happens to run.
+        seg() { case "$$1" in processor-1) echo processor1 ;; *) echo "$$1" ;; esac; }
+
+        render() {
+          {
+          echo "# GENERATED by traefik-init — do not edit."
+          echo "# Sources: .env XPLG_TRAEFIK_*_SERVERS + the registry folder."
+          echo "# Custom routes belong in a SEPARATE file in this directory."
+          echo "http:"
+          echo "  routers:"
+
+          # default entries: / -> ui on 80/443, / -> master on 30303/30443
+          for spec in "web ui xplg-default-ui plain" \
+                      "websecure ui xplg-default-ui-tls tls" \
+                      "masterweb master xplg-default-master plain" \
+                      "mastersecure master xplg-default-master-tls tls"; do
+            set -- $$spec
+            eval "mem=\$$MEMBERS_$$(upper $$2)"
+            [ -n "$$mem" ] || continue
+            echo "    $$3:"
+            echo "      entryPoints: [$$1]"
+            echo "      rule: \"PathPrefix(\`/\`)\""
+            echo "      priority: 50"
+            echo "      service: xplg-$$2"
+            [ "$$4" = tls ] && echo "      tls: {}"
+          done
+
+          # per-role full-tree entry points (no prefix strip); a role with an
+          # empty pool is skipped so Traefik never sees a dangling service ref
+          for spec in "ui ui" "listener listener" "processor processor" \
+                      "processor1 processor-1" "master master"; do
+            set -- $$spec
+            eval "mem=\$$MEMBERS_$$(upper $$2)"
+            [ -n "$$mem" ] || continue
+            echo "    xplg-$$2-direct:"
+            echo "      entryPoints: [$$1]"
+            echo "      rule: \"PathPrefix(\`/\`)\""
+            echo "      service: xplg-$$2"
+          done
+
+          for role in ui master listener processor processor-1; do
+            eval "mem=\$$MEMBERS_$$(upper $$role)"
+            [ -n "$$mem" ] || continue
+            rp="$$(seg $$role)"
+            # /<role> group route. PathPrefix is a plain string prefix, so
+            # /processor also matches /processor1 — the latter needs to outrank
+            # it. Indexed and per-node routes outrank every group route.
+            prio=150; [ "$$role" = processor-1 ] && prio=260
+            for ep in web websecure; do
+              sfx=""; [ "$$ep" = websecure ] && sfx="-tls"
+              echo "    xplg-$$role-path$$sfx:"
+              echo "      entryPoints: [$$ep]"
+              echo "      rule: \"PathPrefix(\`/$$rp\`)\""
+              echo "      priority: $$prio"
+              echo "      middlewares: [xplg-$$role-strip]"
+              echo "      service: xplg-$$role"
+              [ "$$ep" = websecure ] && echo "      tls: {}"
+            done
+            i=0
+            for m in $$mem; do
+              i=$$((i+1)); alias="$${m%%|*}"
+              for ep in web websecure; do
+                sfx=""; [ "$$ep" = websecure ] && sfx="-tls"
+                # indexed  /<role>-<n>
+                echo "    xplg-$$role-n$$i$$sfx:"
+                echo "      entryPoints: [$$ep]"
+                echo "      rule: \"PathPrefix(\`/$$rp-$$i\`)\""
+                echo "      priority: 400"
+                echo "      middlewares: [xplg-$$role-n$$i-strip]"
+                echo "      service: xplg-$$role-n$$i"
+                [ "$$ep" = websecure ] && echo "      tls: {}"
+                # node alias  /<alias>-<role>
+                echo "    xplg-node-$$alias-$$role$$sfx:"
+                echo "      entryPoints: [$$ep]"
+                echo "      rule: \"PathPrefix(\`/$$alias-$$role\`)\""
+                echo "      priority: 500"
+                echo "      middlewares: [xplg-node-$$alias-$$role-strip]"
+                echo "      service: xplg-$$role-n$$i"
+                [ "$$ep" = websecure ] && echo "      tls: {}"
+              done
+            done
+          done
+
+          echo "  middlewares:"
+          for role in ui master listener processor processor-1; do
+            eval "mem=\$$MEMBERS_$$(upper $$role)"
+            [ -n "$$mem" ] || continue
+            rp="$$(seg $$role)"
+            echo "    xplg-$$role-strip:"
+            echo "      stripPrefix: { prefixes: [/$$rp] }"
+            i=0
+            for m in $$mem; do
+              i=$$((i+1)); alias="$${m%%|*}"
+              echo "    xplg-$$role-n$$i-strip:"
+              echo "      stripPrefix: { prefixes: [/$$rp-$$i] }"
+              echo "    xplg-node-$$alias-$$role-strip:"
+              echo "      stripPrefix: { prefixes: [/$$alias-$$role] }"
+            done
+          done
+
+          echo "  services:"
+          for role in ui master listener processor processor-1; do
+            eval "mem=\$$MEMBERS_$$(upper $$role)"
+            [ -n "$$mem" ] || continue
+            echo "    xplg-$$role:"
+            echo "      loadBalancer:"
+            echo "        healthCheck: { path: /, interval: 15s, timeout: 10s }"
+            echo "        sticky:"
+            echo "          cookie: { name: XPLG_$$(upper $$role), httpOnly: true, sameSite: lax, path: / }"
+            echo "        servers:"
+            for m in $$mem; do echo "          - url: \"http://$${m#*|}\""; done
+            # Per-node services deliberately carry NO health check. They are
+            # single-server by definition, so a check would only duplicate the
+            # pool's probe against the same JVM — with every role that doubles
+            # the poll rate and the extra concurrent requests are what make the
+            # checks time out on an otherwise 4ms endpoint.
+            i=0
+            for m in $$mem; do
+              i=$$((i+1))
+              echo "    xplg-$$role-n$$i:"
+              echo "      loadBalancer:"
+              echo "        servers:"
+              echo "          - url: \"http://$${m#*|}\""
+            done
+          done
+          } > /out/.xplg-routes.tmp
+          mv /out/.xplg-routes.tmp /out/xplg-routes.yml
+        }
+
+        prev=""
+        while :; do
+          MEMBERS_UI="$$(pool ui "$$XPLG_TRAEFIK_UI_SERVERS" "$$UI_HTTP_PORT")"
+          MEMBERS_MASTER="$$(pool master "$$XPLG_TRAEFIK_MASTER_SERVERS" "$$MASTER_HTTP_PORT")"
+          MEMBERS_LISTENER="$$(pool listener "$$XPLG_TRAEFIK_LISTENER_SERVERS" "$$LISTENER_HTTP_PORT")"
+          MEMBERS_PROCESSOR="$$(pool processor "$$XPLG_TRAEFIK_PROCESSOR_SERVERS" "$$PROCESSOR_HTTP_PORT")"
+          MEMBERS_PROCESSOR_1="$$(pool processor-1 "$$XPLG_TRAEFIK_PROCESSOR_1_SERVERS" "$$PROCESSOR_1_HTTP_PORT")"
+          now="$$MEMBERS_UI|$$MEMBERS_MASTER|$$MEMBERS_LISTENER|$$MEMBERS_PROCESSOR|$$MEMBERS_PROCESSOR_1"
+          if [ "$$now" != "$$prev" ]; then
+            render
+            echo "[traefik-init] rendered  ui=[$$MEMBERS_UI ]  master=[$$MEMBERS_MASTER ]  listener=[$$MEMBERS_LISTENER ]  processor=[$$MEMBERS_PROCESSOR ]  processor-1=[$$MEMBERS_PROCESSOR_1 ]"
+            prev="$$now"
+          fi
+          sleep 10
+        done
+
+  # -- traefik: the cluster entry point --------------------------------------
+  traefik:
+    image: ${XPLG_TRAEFIK_IMAGE:-traefik:v3.7}
+    container_name: ${COMPOSE_PROJECT_NAME:-xplg-service}-${SELF_ALIAS:-xplg-seed-1}-traefik
+    restart: unless-stopped
+    # bridge (default) publishes the ports below, so they can be remapped and
+    # two clusters can co-run on one host. Switch to `host` where port DNAT is
+    # unavailable — notably ROOTFUL podman on a WSL kernel, where the
+    # firewall_driver="none" workaround for the missing nft_fib also disables
+    # the nftables DNAT that publishing depends on. In host mode the `ports`
+    # list is ignored and Traefik binds 80/443/30303/30443/8304-8308/8080
+    # directly, exactly like the roles do.
+    # Host network, exactly like the roles. That is what lets the edge use the
+    # SAME seed map as every other node — one alias -> IP definition for the
+    # whole stack, no edge-specific addressing. It also sidesteps rootless port
+    # publishing entirely (no rootlessport, no DNAT), so 80/443 work wherever
+    # the kernel lets an unprivileged process bind them.
+    network_mode: host
+    command:
+      - "--providers.file.directory=/etc/traefik/dynamic"
+      - "--providers.file.watch=true"
+      # Entry ports bind directly on the host — there is no publish mapping to
+      # keep in sync, so these ARE the ports.
+      - "--entrypoints.web.address=:${XPLG_TRAEFIK_HTTP_PORT:-80}"
+      - "--entrypoints.websecure.address=:${XPLG_TRAEFIK_HTTPS_PORT:-443}"
+      - "--entrypoints.masterweb.address=:${XPLG_TRAEFIK_MASTER_HTTP_PORT:-30303}"
+      - "--entrypoints.mastersecure.address=:${XPLG_TRAEFIK_MASTER_HTTPS_PORT:-30443}"
+      - "--entrypoints.ui.address=:${XPLG_TRAEFIK_UI_PORT:-8304}"
+      - "--entrypoints.listener.address=:${XPLG_TRAEFIK_LISTENER_PORT:-8305}"
+      - "--entrypoints.processor.address=:${XPLG_TRAEFIK_PROCESSOR_PORT:-8306}"
+      - "--entrypoints.processor1.address=:${XPLG_TRAEFIK_PROCESSOR_1_PORT:-8307}"
+      - "--entrypoints.master.address=:${XPLG_TRAEFIK_MASTER_PORT:-8308}"
+      - "--api.dashboard=true"
+      - "--api.insecure=true"
+      # Dashboard is api.insecure — loopback only, never the LAN.
+      - "--entrypoints.traefik.address=127.0.0.1:${XPLG_TRAEFIK_DASHBOARD_PORT:-8080}"
+      - "--ping=true"
+      - "--log.level=INFO"
+    # ONE alias -> IP map for the whole stack: the edge is host-network like the
+    # roles, so it resolves every seed exactly the way the nodes do. Same values
+    # on every server, no edge-specific override.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+      - "xplg-seed-1:${XPLG_SEED_1_IP:-host-gateway}"
+      - "xplg-seed-2:${XPLG_SEED_2_IP:-host-gateway}"
+      - "xplg-seed-3:${XPLG_SEED_3_IP:-host-gateway}"
+      - "xplg-seed-4:${XPLG_SEED_4_IP:-host-gateway}"
+      - "xplg-seed-5:${XPLG_SEED_5_IP:-host-gateway}"
+      - "xplg-seed-6:${XPLG_SEED_6_IP:-host-gateway}"
+    volumes:
+      # 'z' = SELinux shared relabel (RHEL/podman); harmless elsewhere.
+      - ${XPLG_TRAEFIK_DYNAMIC_PATH:-./conf/dynamic}:/etc/traefik/dynamic:ro,z
+      - ${XPLG_TRAEFIK_SSL_PATH:-./conf/ssl}:/etc/traefik/ssl:ro,z
+    depends_on:
+      - traefik-init
+    labels:
+      - "x8.storm=${COMPOSE_PROJECT_NAME:-xplg-service}"
+      - "x8.cluster=${XPLG_IGNITE_CLUSTER_NAME:-xplg-cache-cluster}"
+      - "x8.alias=${SELF_ALIAS:-xplg-seed-1}"
+      - "x8.role=edge"
+    healthcheck:
+      test: ["CMD", "traefik", "healthcheck", "--ping"]
+      interval: 15s
+      timeout: 5s
