@@ -1,0 +1,601 @@
+# ============================================================================
+# xplg-service — host-network cluster, SAME file on every server
+# docker + podman (rootless-aware). Role selection via COMPOSE_PROFILES.
+# ============================================================================
+#   Bundles : master | server (ui+listener+processor) |
+#             server-additional (processor+processor-1, no ui)
+#   Per-type: ui | listener | processor | processor-1  → single-container
+#             servers (e.g. 6-server layout, one role each)
+#   Edge    : traefik → embedded LB/entry point. Enable on the server(s)
+#             that should serve the cluster (usually ONE — it routes to ALL
+#             nodes on ALL servers directly via the seed aliases; enabling it
+#             on several servers gives equal, independent entry points).
+#             e.g. COMPOSE_PROFILES=master,server,traefik
+# .env per server sets: SELF_ALIAS (xplg-seed-N; unset defaults to
+# xplg-seed-1 for single-engine dev — MULTI-SERVER MUST SET IT, else two
+# servers collide on node names and the join is refused), COMPOSE_PROFILES,
+# and the seed IP map. Ignite init is not a knob: the master does it, every
+# other role is false.
+#
+# Port slots (bind == reachable == advertised; unique per server, reused
+# across servers). DEFAULTS shown — every port is overridable per cluster in
+# .env via {ROLE}_{KIND}_PORT vars (MASTER_HTTP_PORT, UI_HAZELCAST_PORT,
+# PROCESSOR_IGNITE_NET_PORT, LISTENER_SHUTDOWN_PORT, ...), so a SECOND
+# cluster can co-run on the same host(s) with a shifted port set:
+#   role         MAIN   SSL    ignite-disc  hz     client  rest   aux
+#   master       30308  30448  13344        11473  10800   10300  1468-1472
+#   ui           30304  30444  13345        11474  10801   10301  1479-1483
+#   listener     30305  30445  13346        11475  10802   10302  1484-1488
+#   processor    30306  30446  13347        11476  10803   10303  1489-1493
+#   processor-1  30307  30447  13348        11477  10804   10304  1494-1498
+#
+# Co-located clusters (same host, different .env): also set distinct
+# COMPOSE_PROJECT_NAME + XPLG_BASE_HOST_PATH, and override
+# XPLG_IGNITE_DISCOVERY_SEEDS / XPLG_HAZELCAST_MEMBERS with the shifted
+# ports (hazelcast members as alias:port so the two clusters never probe
+# each other's port range).
+#
+# ── PODMAN ROOTLESS notes ──────────────────────────────────────────────────
+#  • cgroups v2 required (RHEL9 default) or memory limits are IGNORED and
+#    JAVA_MAX_RAM_PERCENTAGE sizes heap from HOST RAM — verify:
+#    podman info --format '{{.Host.CgroupsVersion}}' == v2.
+#  • restart: unless-stopped needs `systemctl --user enable podman-restart`
+#    (or run via quadlet/systemd units).
+#  • oom_score_adj < 0 and unlimited memlock are NOT permitted rootless —
+#    both left out/bounded below. IPC_LOCK kept (harmless if unused).
+#  • SELinux (RHEL): local bind mounts need :Z (private label) — applied to
+#    /node/data below. Do NOT label NFS mounts; instead:
+#    sudo setsebool -P virt_use_nfs 1
+#  • UID mapping: container uid 30303 maps to a subuid. Simplest fix:
+#    uncomment `userns_mode: keep-id:uid=30303,gid=0` so host ownership of
+#    bind mounts is your real user.
+#
+# ── NFS for /home/data (extConf) ───────────────────────────────────────────
+#  • ONLY /home/data may live on NFS. NEVER /node/data (Ignite raft/RocksDB/
+#    Chronicle use fsync + mmap + file locks — NFS corrupts/underperforms).
+#  • Mount NFSv4 on the HOST, then bind here. Suggested:
+#    server:/export/xplg /mnt/xplg-shared nfs4 rw,hard,noatime,_netdev 0 0
+#  • root_squash (default) breaks init-perms' chown on /home/data. Either
+#    pre-create ownership on the NFS server (chown 30303:0, chmod 2775) or
+#    export with anonuid=30303,anongid=0,all_squash. init-perms tolerates
+#    chown failure on /home/data (|| true) for this reason.
+# ============================================================================
+
+name: ${COMPOSE_PROJECT_NAME:-xplg-service}
+
+x-xplg-common: &xplg-common
+  image: ${XPLG_IMAGE:-xplghub/images:8.2.0-Main}
+  network_mode: host
+  restart: unless-stopped
+  stop_grace_period: 180s
+  init: true
+  user: "${SERVICE_UID:-30303}:${SERVICE_GID:-0}"
+  userns_mode: "keep-id:uid=30303,gid=0"   # podman rootless: uncomment
+  group_add:
+    - "0"
+  cap_add: [ IPC_LOCK ]
+  # Same alias→IP map on EVERY server; defaults = single-engine dev.
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+    - "xplg-seed-1:${XPLG_SEED_1_IP:-host-gateway}"
+    - "xplg-seed-2:${XPLG_SEED_2_IP:-host-gateway}"
+    - "xplg-seed-3:${XPLG_SEED_3_IP:-host-gateway}"
+    - "xplg-seed-4:${XPLG_SEED_4_IP:-host-gateway}"
+    - "xplg-seed-5:${XPLG_SEED_5_IP:-host-gateway}"
+    - "xplg-seed-6:${XPLG_SEED_6_IP:-host-gateway}"
+  environment: &xplg-env
+    TZ: ${TZ:-UTC}
+    JAVA_MEMORY_MODE: percentage
+    # Heap = % of the CONTAINER limit (cgroup-aware JVM). 40% of 4g = 1.6g
+    # small roles; 40% of 8g = 3.2g processors. See memory budget in README.
+    JAVA_MAX_RAM_PERCENTAGE: "${XPLG_JAVA_MAX_RAM_PERCENTAGE:-40.0}"
+    JAVA_INITIAL_RAM_PERCENTAGE: "${XPLG_JAVA_INITIAL_RAM_PERCENTAGE:-20.0}"
+    JAVA_MAX_METASPACE: "${XPLG_JAVA_MAX_METASPACE:-512m}"
+    CACHE_DATA_DIR: /node/data/cache
+    IGNITE_WORK_DIR: /node/data/cache/ignite
+    XPLG_METRIC_LOG_FILE: /home/data/extConf/log/$${NODE_NAME}/metric.log
+
+    IGNITE_CLUSTER_NAME: ${XPLG_IGNITE_CLUSTER_NAME:-xplg-cache-cluster}
+    IGNITE_SYSTEM_NODE_COUNT:  "${XPLG_IGNITE_SYSTEM_NODE_COUNT:-3}"
+    IGNITE_MIN_CLUSTER_SIZE:   "${XPLG_IGNITE_MIN_CLUSTER_SIZE:-3}"
+    IGNITE_DYNAMIC_JOIN_ENABLED: "true"
+    # Fixed odd-N Raft quorum subsets (node names, e.g. xplg-seed-1-master).
+    # Empty = image defaults. Set BOTH in .env, identical on every server.
+    IGNITE_CMG_NODES: "${IGNITE_CMG_NODES:-}"
+    IGNITE_META_STORAGE_NODES: "${IGNITE_META_STORAGE_NODES:-}"
+
+    # ONE global list each, identical on every server. Ignite: alias:bind-port.
+    # Hazelcast: HOST-ONLY aliases — joiners probe each host across the port
+    # range (base 11473, try.count=20), so the list is valid for any profile
+    # layout and start order.
+    IGNITE_DISCOVERY_SEEDS: "${XPLG_IGNITE_DISCOVERY_SEEDS:-xplg-seed-1:13345,xplg-seed-1:13346,xplg-seed-1:13347,xplg-seed-2:13345,xplg-seed-2:13346,xplg-seed-2:13347,xplg-seed-3:13345,xplg-seed-3:13346,xplg-seed-3:13347,xplg-seed-4:13345,xplg-seed-4:13346,xplg-seed-4:13347}"
+    XPLG_HAZELCAST_MEMBERS: "${XPLG_HAZELCAST_MEMBERS:-xplg-seed-1,xplg-seed-2,xplg-seed-3,xplg-seed-4}"
+    # The cache config (inception-vertx-runner-cache.yaml) reads THESE names —
+    # HAZELCAST_SEED_MEMBER (alias:port CSV) and XPLG_CLUSTER_NAME — not the
+    # -Dhazelcast.* properties. Keep them fed from the same .env vars.
+    # KNOWN ISSUE: members still form standalone size:1 clusters — plugin-side
+    # self-filter bug on same-IP/unique-port topology; see
+    # docs/hazelcast-join-issue.md (needs xplg-cache-hazelcast-plugin fix).
+    HAZELCAST_SEED_MEMBER: "${XPLG_HAZELCAST_MEMBERS:-xplg-seed-1:11743,xplg-seed-1:11744,xplg-seed-2:11744,xplg-seed-2:11745,xplg-seed-3:11744,xplg-seed-3:11745,xplg-seed-4:11745,xplg-seed-4:11746}"
+    XPLG_CLUSTER_NAME: "${XPLG_HAZELCAST_CLUSTER_NAME:-xplg-inception-cluster}"
+
+    # THIS server's alias — each peer resolves it via its own extra_hosts.
+    # Advertised alias:port == own seed entry → ScaleCube self-filter works.
+    IGNITE_ADVERTISE_ADDR: "${SELF_ALIAS:-xplg-seed-1}"
+
+    # Where non-master nodes reach the master to fetch/run jobs. Read by the app
+    # on BOTH sides: the master PUBLISHES this to extConf masterInfo.prop, workers
+    # use it (or the published value). Without it the master self-derives — inside
+    # docker that yields an unroutable address (e.g. a bridge gateway 172.x) and
+    # processors never execute jobs. Use the master's seed alias, resolvable in
+    # every container via extra_hosts: http://xplg-seed-1:30308/logeye
+    XPLG_JOBS_MASTER_CONN: "${XPLG_JOBS_MASTER_CONN:-}"
+
+    XPLG_MAIL_LINK_BASEURL: "${XPLG_MAIL_LINK_BASEURL:-}"
+    # NOTE: MaxDirectMemorySize is per-role in XPLG_OPTS (not here).
+    EXTRA_JAVA_OPTS: >-
+      -XX:+UseZGC
+      -XX:+UnlockExperimentalVMOptions
+      -XX:+AlwaysPreTouch
+      -XX:+UseStringDeduplication
+      -XX:+HeapDumpOnOutOfMemoryError
+      -XX:+ExitOnOutOfMemoryError
+      --enable-native-access=ALL-UNNAMED
+      --add-modules=jdk.incubator.vector
+      --add-opens=java.base/java.lang=ALL-UNNAMED
+      --add-opens=java.base/java.lang.invoke=ALL-UNNAMED
+      --add-opens=java.base/java.lang.reflect=ALL-UNNAMED
+      --add-opens=java.base/java.io=ALL-UNNAMED
+      --add-opens=java.base/java.nio=ALL-UNNAMED
+      --add-opens=java.base/java.math=ALL-UNNAMED
+      --add-opens=java.base/java.util=ALL-UNNAMED
+      --add-opens=java.base/java.time=ALL-UNNAMED
+      --add-opens=java.base/jdk.internal.misc=ALL-UNNAMED
+      --add-opens=java.base/jdk.internal.access=ALL-UNNAMED
+      --add-opens=java.base/sun.nio.ch=ALL-UNNAMED
+      --add-opens=java.base/sun.util.calendar=ALL-UNNAMED
+      --add-opens=java.management/com.sun.jmx.mbeanserver=ALL-UNNAMED
+      --add-opens=java.management/sun.management=ALL-UNNAMED
+      --add-opens=jdk.management/com.sun.management.internal=ALL-UNNAMED
+      --add-opens=jdk.internal.jvmstat/sun.jvmstat.monitor=ALL-UNNAMED
+      --add-opens=jdk.compiler/com.sun.tools.javac=ALL-UNNAMED
+      --add-exports=jdk.compiler/com.sun.tools.javac.file=ALL-UNNAMED
+      --add-exports=java.base/jdk.internal.ref=ALL-UNNAMED
+      --sun-misc-unsafe-memory-access=allow
+      -Dio.netty.tryReflectionSetAccessible=true
+      -Dio.netty.maxDirectMemory=-1
+      -Djava.net.preferIPv4Stack=true
+      -Djava.security.egd=file:/dev/urandom
+      -Djdk.internal.io.uringEnabled=true
+      -Duser.language=${XPLG_LANG:-en}
+      -Duser.country=${XPLG_COUNTRY:-US}
+      -Duser.timezone=${TZ:-UTC}
+      -Djdk.virtualThreadScheduler.parallelism=4
+      -Djdk.virtualThreadScheduler.maxPoolSize=256
+      -Djava.io.tmpdir=/node/data/temp
+      -Dxpolog.home.root.path=/home/data/extConf
+      -XX:FlightRecorderOptions=stackdepth=256,memorysize=32m,repository=/node/data/diagnostics
+      -XX:StartFlightRecording=name=continuous,dumponexit=true,maxsize=64m,maxage=30m,filename=/node/data/diagnostics/flight.jfr
+      -XX:HeapDumpPath=/node/data/diagnostics
+      -Dhazelcast.phone.home.enabled=false
+      -Dhazelcast.socket.bind.any=false
+      -Dhazelcast.diagnostics.enabled=false
+      -Dhazelcast.shutdownhook.policy=GRACEFUL
+      -Dhazelcast.graceful.shutdown.max.wait=60
+      -Dhazelcast.health.monitoring.level=OFF
+      -Dhazelcast.logging.type=slf4j
+      -Dhazelcast.jmx=true
+      -Dhazelcast.tcp.join.port.try.count=20
+    sharedstorage: "xpolog.home.root.path=/home/data/extConf"
+  ulimits:
+    nofile: { soft: 65535, hard: 65535 }
+    # rootless-safe bounded memlock (raise host-side if IPC_LOCK is used):
+    memlock: { soft: 268435456, hard: 268435456 }
+    nproc: 32768
+  shm_size: 4g
+  tmpfs:
+    - /tmp:exec,mode=1777,size=2g
+
+x-resources:
+  small: &res-small
+    resources:
+      limits:       { memory: "${XPLG_MEMORY_LIMIT:-4g}",       cpus: "${XPLG_CPU_LIMIT:-4}" }
+      reservations: { memory: "${XPLG_MEMORY_RESERVATION:-2g}", cpus: "${XPLG_CPU_RESERVATION:-2}" }
+  proc: &res-proc
+    resources:
+      limits:       { memory: "${XPLG_PROCESSOR_MEMORY_LIMIT:-8g}",       cpus: "${XPLG_PROCESSOR_CPU_LIMIT:-6}" }
+      reservations: { memory: "${XPLG_PROCESSOR_MEMORY_RESERVATION:-4g}", cpus: "${XPLG_PROCESSOR_CPU_RESERVATION:-3}" }
+
+x-volumes:
+  # Storage layout — two independent roots, cleanly separable:
+  #   LOCAL  XPLG_BASE_HOST_PATH   → per-role /node/data (Ignite/RocksDB/
+  #          Chronicle: local disk ONLY)
+  #   SHARED XPLG_SHARED_HOST_PATH → /home/data (extConf). Defaults to
+  #          <base>/home/data (same local tree, zero-config dev); point it
+  #          at an NFS mountpoint (e.g. /mnt/xplg-shared) for shared prod.
+  home: &vol-home
+    # /home/data may be an NFS-backed host path — no SELinux label here.
+    type: bind
+    source: ${XPLG_SHARED_HOST_PATH:-${XPLG_BASE_HOST_PATH:-/home/xplg/docker-volume/xplg/xplg-service}/home/data}
+    target: /home/data
+
+services:
+  init-perms:
+    image: ${XPLG_INIT_IMAGE:-alpine:3.24}
+    user: root
+    restart: "no"
+    network_mode: host
+    profiles: ["master", "server", "server-additional", "ui", "listener", "processor", "processor-1"]
+    environment:
+      SERVICE_UID: "${SERVICE_UID:-30303}"
+      SERVICE_GID: "${SERVICE_GID:-0}"
+    volumes:
+      - type: bind
+        source: ${XPLG_BASE_HOST_PATH:-/home/xplg/docker-volume/xplg/xplg-service}
+        target: /base
+      - <<: *vol-home
+        target: /shared
+    command: >
+      sh -ec '
+        uid="$${SERVICE_UID}"; gid="$${SERVICE_GID}"
+        # shared tree (may be NFS w/ root_squash): best-effort, never fatal
+        mkdir -p /shared/extConf/log 2>/dev/null || true
+        if chown -R "$$uid:$$gid" /shared 2>/dev/null; then
+          find /shared -type d -exec chmod 2775 {} + 2>/dev/null || true
+        else
+          echo "WARN: chown/chmod on /home/data skipped (NFS root_squash?) — ensure SERVER-side: chown -R $$uid:$$gid, dirs 2775"
+        fi
+        # local per-role trees: strict — these MUST succeed
+        for n in master ui listener processor processor-1; do
+          for d in cache/ignite/chronicle cache/ignite/cmg cache/ignite/metastorage cache/ignite/partitions cache/ignite/raft diagnostics temp; do
+            mkdir -p "/base/$$n/data/$$d"
+          done
+          chown -R "$$uid:$$gid" "/base/$$n"
+          find "/base/$$n" -type d -exec chmod 2775 {} +
+        done
+        # base root only (non-recursive: never descends into a mounted /shared)
+        chown "$$uid:$$gid" /base 2>/dev/null || true
+        chmod 2775 /base 2>/dev/null || true
+        # VERIFY, do not assume. Without this the roles start against a tree
+        # they cannot write, and every one of them crash-loops on
+        # "Not writable: /home/data" with nothing pointing back here.
+        # su-exec drops to the real service uid:gid and actually writes.
+        apk add --no-cache su-exec >/dev/null 2>&1 || true
+        for d in /shared /base; do
+          if ! su-exec "$$uid:$$gid" sh -c "touch $$d/.perm-probe 2>/dev/null && rm -f $$d/.perm-probe"; then
+            echo "FATAL: $$d is not writable by $$uid:$$gid — it is $$(stat -c "uid=%u gid=%g mode=%a" "$$d")."
+            echo "       Roles would crash-loop on \"Not writable\". Fix the host path:"
+            echo "         chown -R $$uid:$$gid <hostpath> && chmod -R 2775 <hostpath>"
+            echo "       On NFS with root_squash, do it SERVER-side."
+            exit 1
+          fi
+        done
+        echo "init-perms OK: /shared and /base writable by $$uid:$$gid"
+      '
+
+  # ── master (profile: master) — slot 0 ─────────────────────────────────────
+  master:
+    <<: *xplg-common
+    profiles: ["master"]
+    container_name: ${COMPOSE_PROJECT_NAME:-xplg-service}-${SELF_ALIAS:-xplg-seed-1}-master
+    deploy: { <<: *res-small }
+    labels:
+      - "x8.storm=${COMPOSE_PROJECT_NAME:-xplg-service}"
+      - "x8.cluster=${XPLG_IGNITE_CLUSTER_NAME:-xplg-cache-cluster}"
+      - "x8.alias=${SELF_ALIAS:-xplg-seed-1}"
+      - "x8.role=master"
+      - "x8.http.port=${MASTER_HTTP_PORT:-30308}"
+    environment:
+      <<: *xplg-env
+      NODE_NAME: "${SELF_ALIAS:-xplg-seed-1}-master"
+      IGNITE_NODE_NAME: "${SELF_ALIAS:-xplg-seed-1}-master"
+      x8_name: "${SELF_ALIAS:-xplg-seed-1}-master"
+      xpolog.uid.structure: "${SELF_ALIAS:-xplg-seed-1}-master"
+      xplg_inception_init_flow: master
+      xplg_inceptions_post_init_flow_tasks: ${XPLG_MASTER_POST_INIT_TASKS:-clusterExternalConf}
+      # The master initialises the cluster; every other role is hardcoded false
+      # below. A cluster has exactly one master, so this needs no .env knob.
+      IGNITE_INIT_NODE: "true"
+      MAIN_PORT: "${MASTER_HTTP_PORT:-30308}"
+      MAIN_SSL_PORT: "${MASTER_SSL_PORT:-30448}"
+      AUX_PORT_BASE: "${MASTER_AUX_PORT_BASE:-1468}"
+      AUX_PORT_COUNT: "${MASTER_AUX_PORT_COUNT:-5}"
+      HAZELCAST_PORT: "${MASTER_HAZELCAST_PORT:-11473}"
+      IGNITE_DISCOVERY_PORT: "${MASTER_IGNITE_NET_PORT:-13344}"
+      IGNITE_CLIENT_PORT: "${MASTER_IGNITE_CLIENT_PORT:-10800}"
+      IGNITE_REST_PORT: "${MASTER_IGNITE_REST_PORT:-10300}"
+      XPLG_OPTS: >-
+        -XX:MaxDirectMemorySize=${XPLG_DIRECT_MEM_SMALL:-1024m}
+        -Dhazelcast.local.localAddress=${SELF_ALIAS:-xplg-seed-1}
+        -Dhazelcast.members=${XPLG_HAZELCAST_MEMBERS:-xplg-seed-1,xplg-seed-2,xplg-seed-3,xplg-seed-4}
+        -Dhazelcast.local.localPort=${MASTER_HAZELCAST_PORT:-11473}
+        -Dhazelcast.local.publicAddress=${SELF_ALIAS:-xplg-seed-1}:${MASTER_HAZELCAST_PORT:-11473}
+        -Dignite.node.name=${SELF_ALIAS:-xplg-seed-1}-master
+        -Dxplg.http.port=${MASTER_HTTP_PORT:-30308}
+        -Dxplg.ssl.port=${MASTER_SSL_PORT:-30448}
+        -Dxplg.server.shutdown.port=${MASTER_SHUTDOWN_PORT:-8093}
+        -Dxplg.ajp.port=${MASTER_AJP_PORT:-8003}
+    volumes:
+      - *vol-home
+      - ${XPLG_BASE_HOST_PATH:-/home/xplg/docker-volume/xplg/xplg-service}/master/data:/node/data:Z
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:${MASTER_HTTP_PORT:-30308}/", "-o", "/dev/null"]
+      interval: 30s
+      timeout: 10s
+      start_period: 90s
+      retries: 3
+    depends_on:
+      init-perms: { condition: service_completed_successfully }
+
+  # ── ui (profile: server) — slot 1 ─────────────────────────────────────────
+  ui:
+    <<: *xplg-common
+    profiles: ["server", "ui"]
+    container_name: ${COMPOSE_PROJECT_NAME:-xplg-service}-${SELF_ALIAS:-xplg-seed-1}-ui
+    deploy: { <<: *res-small }
+    labels:
+      - "x8.storm=${COMPOSE_PROJECT_NAME:-xplg-service}"
+      - "x8.cluster=${XPLG_IGNITE_CLUSTER_NAME:-xplg-cache-cluster}"
+      - "x8.alias=${SELF_ALIAS:-xplg-seed-1}"
+      - "x8.role=ui"
+      - "x8.http.port=${UI_HTTP_PORT:-30304}"
+    environment:
+      <<: *xplg-env
+      NODE_NAME: "${SELF_ALIAS:-xplg-seed-1}-ui"
+      IGNITE_NODE_NAME: "${SELF_ALIAS:-xplg-seed-1}-ui"
+      x8_name: "${SELF_ALIAS:-xplg-seed-1}-ui"
+      xpolog.uid.structure: "${SELF_ALIAS:-xplg-seed-1}-ui"
+      xplg_inception_init_flow: ui
+      xplg_inceptions_post_init_flow_tasks: waitForFile
+      IGNITE_INIT_NODE: "false"
+      MAIN_PORT: "${UI_HTTP_PORT:-30304}"
+      MAIN_SSL_PORT: "${UI_SSL_PORT:-30444}"
+      AUX_PORT_BASE: "${UI_AUX_PORT_BASE:-1479}"
+      AUX_PORT_COUNT: "${UI_AUX_PORT_COUNT:-5}"
+      HAZELCAST_PORT: "${UI_HAZELCAST_PORT:-11474}"
+      IGNITE_DISCOVERY_PORT: "${UI_IGNITE_NET_PORT:-13345}"
+      IGNITE_CLIENT_PORT: "${UI_IGNITE_CLIENT_PORT:-10801}"
+      IGNITE_REST_PORT: "${UI_IGNITE_REST_PORT:-10301}"
+      XPLG_OPTS: >-
+        -XX:MaxDirectMemorySize=${XPLG_DIRECT_MEM_SMALL:-1024m}
+        -Dhazelcast.local.localAddress=${SELF_ALIAS:-xplg-seed-1}
+        -Dhazelcast.members=${XPLG_HAZELCAST_MEMBERS:-xplg-seed-1,xplg-seed-2,xplg-seed-3,xplg-seed-4}
+        -Dhazelcast.local.localPort=${UI_HAZELCAST_PORT:-11474}
+        -Dhazelcast.local.publicAddress=${SELF_ALIAS:-xplg-seed-1}:${UI_HAZELCAST_PORT:-11474}
+        -Dignite.node.name=${SELF_ALIAS:-xplg-seed-1}-ui
+        -Dxplg.http.port=${UI_HTTP_PORT:-30304}
+        -Dxplg.ssl.port=${UI_SSL_PORT:-30444}
+        -Dxplg.server.shutdown.port=${UI_SHUTDOWN_PORT:-8094}
+        -Dxplg.ajp.port=${UI_AJP_PORT:-8004}
+    volumes:
+      - *vol-home
+      - ${XPLG_BASE_HOST_PATH:-/home/xplg/docker-volume/xplg/xplg-service}/ui/data:/node/data:Z
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:${UI_HTTP_PORT:-30304}/", "-o", "/dev/null"]
+      interval: 30s
+      timeout: 10s
+      start_period: 90s
+      retries: 3
+    depends_on:
+      init-perms: { condition: service_completed_successfully }
+
+  # ── listener (profile: server) — slot 2 ───────────────────────────────────
+  listener:
+    <<: *xplg-common
+    profiles: ["server", "listener"]
+    container_name: ${COMPOSE_PROJECT_NAME:-xplg-service}-${SELF_ALIAS:-xplg-seed-1}-listener
+    deploy: { <<: *res-small }
+    labels:
+      - "x8.storm=${COMPOSE_PROJECT_NAME:-xplg-service}"
+      - "x8.cluster=${XPLG_IGNITE_CLUSTER_NAME:-xplg-cache-cluster}"
+      - "x8.alias=${SELF_ALIAS:-xplg-seed-1}"
+      - "x8.role=listener"
+      - "x8.http.port=${LISTENER_HTTP_PORT:-30305}"
+    environment:
+      <<: *xplg-env
+      NODE_NAME: "${SELF_ALIAS:-xplg-seed-1}-listener"
+      IGNITE_NODE_NAME: "${SELF_ALIAS:-xplg-seed-1}-listener"
+      x8_name: "${SELF_ALIAS:-xplg-seed-1}-listener"
+      xpolog.uid.structure: "${SELF_ALIAS:-xplg-seed-1}-listener"
+      xplg_inception_init_flow: listener
+      xplg_inceptions_post_init_flow_tasks: waitForFile
+      IGNITE_INIT_NODE: "false"
+      MAIN_PORT: "${LISTENER_HTTP_PORT:-30305}"
+      MAIN_SSL_PORT: "${LISTENER_SSL_PORT:-30445}"
+      AUX_PORT_BASE: "${LISTENER_AUX_PORT_BASE:-1484}"
+      AUX_PORT_COUNT: "${LISTENER_AUX_PORT_COUNT:-5}"
+      HAZELCAST_PORT: "${LISTENER_HAZELCAST_PORT:-11475}"
+      IGNITE_DISCOVERY_PORT: "${LISTENER_IGNITE_NET_PORT:-13346}"
+      IGNITE_CLIENT_PORT: "${LISTENER_IGNITE_CLIENT_PORT:-10802}"
+      IGNITE_REST_PORT: "${LISTENER_IGNITE_REST_PORT:-10302}"
+      XPLG_OPTS: >-
+        -XX:MaxDirectMemorySize=${XPLG_DIRECT_MEM_SMALL:-1024m}
+        -Dhazelcast.local.localAddress=${SELF_ALIAS:-xplg-seed-1}
+        -Dhazelcast.members=${XPLG_HAZELCAST_MEMBERS:-xplg-seed-1,xplg-seed-2,xplg-seed-3,xplg-seed-4}
+        -Dhazelcast.local.localPort=${LISTENER_HAZELCAST_PORT:-11475}
+        -Dhazelcast.local.publicAddress=${SELF_ALIAS:-xplg-seed-1}:${LISTENER_HAZELCAST_PORT:-11475}
+        -Dignite.node.name=${SELF_ALIAS:-xplg-seed-1}-listener
+        -DrecycleCronExpression=
+        -Dxplg.http.port=${LISTENER_HTTP_PORT:-30305}
+        -Dxplg.ssl.port=${LISTENER_SSL_PORT:-30445}
+        -Dxplg.server.shutdown.port=${LISTENER_SHUTDOWN_PORT:-8095}
+        -Dxplg.ajp.port=${LISTENER_AJP_PORT:-8005}
+    volumes:
+      - *vol-home
+      - ${XPLG_BASE_HOST_PATH:-/home/xplg/docker-volume/xplg/xplg-service}/listener/data:/node/data:Z
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:${LISTENER_HTTP_PORT:-30305}/", "-o", "/dev/null"]
+      interval: 30s
+      timeout: 10s
+      start_period: 90s
+      retries: 3
+    depends_on:
+      init-perms: { condition: service_completed_successfully }
+
+  # ── processor (profiles: server, server-additional) — slot 3 ──────────────
+  processor:
+    <<: *xplg-common
+    profiles: ["server", "server-additional", "processor"]
+    container_name: ${COMPOSE_PROJECT_NAME:-xplg-service}-${SELF_ALIAS:-xplg-seed-1}-processor
+    deploy: { <<: *res-proc }
+    labels:
+      - "x8.storm=${COMPOSE_PROJECT_NAME:-xplg-service}"
+      - "x8.cluster=${XPLG_IGNITE_CLUSTER_NAME:-xplg-cache-cluster}"
+      - "x8.alias=${SELF_ALIAS:-xplg-seed-1}"
+      - "x8.role=processor"
+      - "x8.http.port=${PROCESSOR_HTTP_PORT:-30306}"
+    environment:
+      <<: *xplg-env
+      NODE_NAME: "${SELF_ALIAS:-xplg-seed-1}-processor"
+      IGNITE_NODE_NAME: "${SELF_ALIAS:-xplg-seed-1}-processor"
+      x8_name: "${SELF_ALIAS:-xplg-seed-1}-processor"
+      xpolog.uid.structure: "${SELF_ALIAS:-xplg-seed-1}-processor"
+      xplg_inception_init_flow: processor
+      xplg_inceptions_post_init_flow_tasks: waitForFile
+      IGNITE_INIT_NODE: "false"
+      MAIN_PORT: "${PROCESSOR_HTTP_PORT:-30306}"
+      MAIN_SSL_PORT: "${PROCESSOR_SSL_PORT:-30446}"
+      AUX_PORT_BASE: "${PROCESSOR_AUX_PORT_BASE:-1489}"
+      AUX_PORT_COUNT: "${PROCESSOR_AUX_PORT_COUNT:-5}"
+      HAZELCAST_PORT: "${PROCESSOR_HAZELCAST_PORT:-11476}"
+      IGNITE_DISCOVERY_PORT: "${PROCESSOR_IGNITE_NET_PORT:-13347}"
+      IGNITE_CLIENT_PORT: "${PROCESSOR_IGNITE_CLIENT_PORT:-10803}"
+      IGNITE_REST_PORT: "${PROCESSOR_IGNITE_REST_PORT:-10303}"
+      XPLG_OPTS: >-
+        -XX:MaxDirectMemorySize=${XPLG_DIRECT_MEM_PROC:-1536m}
+        -Dhazelcast.local.localAddress=${SELF_ALIAS:-xplg-seed-1}
+        -Dhazelcast.members=${XPLG_HAZELCAST_MEMBERS:-xplg-seed-1,xplg-seed-2,xplg-seed-3,xplg-seed-4}
+        -Dhazelcast.local.localPort=${PROCESSOR_HAZELCAST_PORT:-11476}
+        -Dhazelcast.local.publicAddress=${SELF_ALIAS:-xplg-seed-1}:${PROCESSOR_HAZELCAST_PORT:-11476}
+        -Dignite.node.name=${SELF_ALIAS:-xplg-seed-1}-processor
+        -Dxplg.http.port=${PROCESSOR_HTTP_PORT:-30306}
+        -Dxplg.ssl.port=${PROCESSOR_SSL_PORT:-30446}
+        -Dxplg.server.shutdown.port=${PROCESSOR_SHUTDOWN_PORT:-8096}
+        -Dxplg.ajp.port=${PROCESSOR_AJP_PORT:-8006}
+    volumes:
+      - *vol-home
+      - ${XPLG_BASE_HOST_PATH:-/home/xplg/docker-volume/xplg/xplg-service}/processor/data:/node/data:Z
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:${PROCESSOR_HTTP_PORT:-30306}/", "-o", "/dev/null"]
+      interval: 30s
+      timeout: 10s
+      start_period: 90s
+      retries: 3
+    depends_on:
+      init-perms: { condition: service_completed_successfully }
+
+  # ── processor-1 (profile: server-additional) — slot 4 ─────────────────────
+  processor-1:
+    <<: *xplg-common
+    profiles: ["server-additional", "processor-1"]
+    container_name: ${COMPOSE_PROJECT_NAME:-xplg-service}-${SELF_ALIAS:-xplg-seed-1}-processor-1
+    deploy: { <<: *res-proc }
+    labels:
+      - "x8.storm=${COMPOSE_PROJECT_NAME:-xplg-service}"
+      - "x8.cluster=${XPLG_IGNITE_CLUSTER_NAME:-xplg-cache-cluster}"
+      - "x8.alias=${SELF_ALIAS:-xplg-seed-1}"
+      - "x8.role=processor-1"
+      - "x8.http.port=${PROCESSOR_1_HTTP_PORT:-30307}"
+    environment:
+      <<: *xplg-env
+      NODE_NAME: "${SELF_ALIAS:-xplg-seed-1}-processor-1"
+      IGNITE_NODE_NAME: "${SELF_ALIAS:-xplg-seed-1}-processor-1"
+      x8_name: "${SELF_ALIAS:-xplg-seed-1}-processor-1"
+      xpolog.uid.structure: "${SELF_ALIAS:-xplg-seed-1}-processor-1"
+      xplg_inception_init_flow: processor
+      xplg_inceptions_post_init_flow_tasks: waitForFile
+      IGNITE_INIT_NODE: "false"
+      MAIN_PORT: "${PROCESSOR_1_HTTP_PORT:-30307}"
+      MAIN_SSL_PORT: "${PROCESSOR_1_SSL_PORT:-30447}"
+      AUX_PORT_BASE: "${PROCESSOR_1_AUX_PORT_BASE:-1494}"
+      AUX_PORT_COUNT: "${PROCESSOR_1_AUX_PORT_COUNT:-5}"
+      HAZELCAST_PORT: "${PROCESSOR_1_HAZELCAST_PORT:-11477}"
+      IGNITE_DISCOVERY_PORT: "${PROCESSOR_1_IGNITE_NET_PORT:-13348}"
+      IGNITE_CLIENT_PORT: "${PROCESSOR_1_IGNITE_CLIENT_PORT:-10804}"
+      IGNITE_REST_PORT: "${PROCESSOR_1_IGNITE_REST_PORT:-10304}"
+      XPLG_OPTS: >-
+        -XX:MaxDirectMemorySize=${XPLG_DIRECT_MEM_PROC:-1536m}
+        -Dhazelcast.local.localAddress=${SELF_ALIAS:-xplg-seed-1}
+        -Dhazelcast.members=${XPLG_HAZELCAST_MEMBERS:-xplg-seed-1,xplg-seed-2,xplg-seed-3,xplg-seed-4}
+        -Dhazelcast.local.localPort=${PROCESSOR_1_HAZELCAST_PORT:-11477}
+        -Dhazelcast.local.publicAddress=${SELF_ALIAS:-xplg-seed-1}:${PROCESSOR_1_HAZELCAST_PORT:-11477}
+        -Dignite.node.name=${SELF_ALIAS:-xplg-seed-1}-processor-1
+        -Dxplg.http.port=${PROCESSOR_1_HTTP_PORT:-30307}
+        -Dxplg.ssl.port=${PROCESSOR_1_SSL_PORT:-30447}
+        -Dxplg.server.shutdown.port=${PROCESSOR_1_SHUTDOWN_PORT:-8097}
+        -Dxplg.ajp.port=${PROCESSOR_1_AJP_PORT:-8007}
+    volumes:
+      - *vol-home
+      - ${XPLG_BASE_HOST_PATH:-/home/xplg/docker-volume/xplg/xplg-service}/processor-1/data:/node/data:Z
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:${PROCESSOR_1_HTTP_PORT:-30307}/", "-o", "/dev/null"]
+      interval: 30s
+      timeout: 10s
+      start_period: 90s
+      retries: 3
+    depends_on:
+      init-perms: { condition: service_completed_successfully }
+
+
+  # ── node-register — every local node registers ITSELF with Traefik ────────
+  # Writes one file per role active on THIS server into the Traefik registry
+  # folder (XPLG_TRAEFIK_REGISTRY_PATH, default ./conf/registry):
+  #
+  #     <registry>/<alias>-<role>.node  content: <role> <alias> <host>:<port>
+  #
+  # traefik-init (docker-compose.traefik.yml) reconciles that folder into the
+  # route table every few seconds, so a node coming up on ANY server joins the
+  # group pool with NO edit to .env and NO Traefik restart. Point the registry
+  # at the shared/NFS path to make it cluster-wide; leave it local for
+  # single-server. Dead entries are harmless — Traefik health-checks them out
+  # of the pool, and the file is rewritten on every start.
+  #
+  # Roles are derived from COMPOSE_PROFILES, so this one container covers
+  # whatever bundle this server runs.
+  node-register:
+    image: ${XPLG_INIT_IMAGE:-alpine:3.24}
+    restart: "no"
+    user: root
+    network_mode: host
+    profiles: ["master", "server", "server-additional", "ui", "listener", "processor", "processor-1"]
+    environment:
+      ACTIVE_PROFILES: "${COMPOSE_PROFILES:-}"
+      SELF_ALIAS: "${SELF_ALIAS:-xplg-seed-1}"
+      REG_HOST: "${XPLG_TRAEFIK_REGISTER_HOST:-${SELF_ALIAS:-xplg-seed-1}}"
+      MASTER_HTTP_PORT: "${MASTER_HTTP_PORT:-30308}"
+      UI_HTTP_PORT: "${UI_HTTP_PORT:-30304}"
+      LISTENER_HTTP_PORT: "${LISTENER_HTTP_PORT:-30305}"
+      PROCESSOR_HTTP_PORT: "${PROCESSOR_HTTP_PORT:-30306}"
+      PROCESSOR_1_HTTP_PORT: "${PROCESSOR_1_HTTP_PORT:-30307}"
+    volumes:
+      - ${XPLG_TRAEFIK_REGISTRY_PATH:-./conf/registry}:/registry:z
+    command:
+      - sh
+      - -ec
+      - |
+        mkdir -p /registry
+        # profile -> roles on this server
+        roles=""
+        for p in $$(echo "$$ACTIVE_PROFILES" | tr ',' ' '); do
+          case "$$p" in
+            master)            roles="$$roles master" ;;
+            server)            roles="$$roles ui listener processor" ;;
+            server-additional) roles="$$roles processor processor-1" ;;
+            ui|listener|processor|processor-1) roles="$$roles $$p" ;;
+          esac
+        done
+        [ -n "$$roles" ] || roles="master ui listener processor"
+        for r in $$roles; do
+          case "$$r" in
+            master)      port="$$MASTER_HTTP_PORT" ;;
+            ui)          port="$$UI_HTTP_PORT" ;;
+            listener)    port="$$LISTENER_HTTP_PORT" ;;
+            processor)   port="$$PROCESSOR_HTTP_PORT" ;;
+            processor-1) port="$$PROCESSOR_1_HTTP_PORT" ;;
+            *) continue ;;
+          esac
+          f="/registry/$${SELF_ALIAS}-$${r}.node"
+          printf '%s %s %s:%s\n' "$$r" "$$SELF_ALIAS" "$$REG_HOST" "$$port" > "$$f.tmp"
+          mv "$$f.tmp" "$$f"
+          echo "registered $$r -> $$REG_HOST:$$port  ($$f)"
+        done
